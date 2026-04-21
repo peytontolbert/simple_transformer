@@ -1,5 +1,6 @@
 import torch
 from transformer.model import SimpleTransformer
+from transformer import _model_stack
 import numpy as np
 
 def load_model(model_path, vocab_size, d_model=256, num_heads=8, num_layers=3):
@@ -22,26 +23,13 @@ def load_model(model_path, vocab_size, d_model=256, num_heads=8, num_layers=3):
 
 def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
     """Filter a distribution of logits using top-k and/or nucleus (top-p) filtering."""
-    top_k = min(top_k, logits.size(-1))  # Safety check
-    
-    if top_k > 0:
-        # Remove all tokens with a probability less than the last token of the top-k
-        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-        logits[indices_to_remove] = filter_value
-        
-    if top_p > 0.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-        
-        # Remove tokens with cumulative probability above the threshold
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-        
-        indices_to_remove = sorted_indices[sorted_indices_to_remove]
-        logits[indices_to_remove] = filter_value
-    
-    return logits
+    top_k = min(top_k, logits.size(-1))
+    return _model_stack.runtime_filter_logits(
+        logits,
+        top_k=top_k,
+        top_p=top_p,
+        filter_value=filter_value,
+    )
 
 def generate_sequence(model, start_sequence, max_length=100, temperature=0.7, top_k=50, top_p=0.9, end_token=None):
     """Generate a sequence using the trained model with better sampling strategies"""
@@ -51,21 +39,18 @@ def generate_sequence(model, start_sequence, max_length=100, temperature=0.7, to
     with torch.no_grad():
         current_sequence = start_sequence.to(device)
         
-        for _ in range(max_length - len(start_sequence)):
+        for _ in range(max_length - current_sequence.size(1)):
             # Get model predictions
             output = model(current_sequence)
-            next_token_logits = output[:, -1, :] / temperature
-            
-            # Apply filtering
-            filtered_logits = top_k_top_p_filtering(
+            next_token_logits = output[:, -1, :]
+
+            next_token = _model_stack.sample_next_token(
                 next_token_logits,
+                current_sequence,
+                temperature=temperature,
                 top_k=top_k,
-                top_p=top_p
+                top_p=top_p,
             )
-            
-            # Sample from the filtered distribution
-            probs = torch.softmax(filtered_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
             
             # Append to sequence
             current_sequence = torch.cat([current_sequence, next_token], dim=1)

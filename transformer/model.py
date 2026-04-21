@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import math
 
+from . import _model_stack
+
+
 def create_causal_mask(size):
     """Create causal mask to prevent attending to future tokens"""
     mask = torch.triu(torch.ones(size, size), diagonal=1).bool()
@@ -21,26 +24,17 @@ class MultiHeadAttention(nn.Module):
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
         
-    def scaled_dot_product_attention(self, Q, K, V, mask=None):
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        
-        if mask is not None:
-            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
-        
-        attn_probs = torch.softmax(attn_scores, dim=-1)
-        output = torch.matmul(attn_probs, V)
-        return output
-        
-    def forward(self, Q, K, V, mask=None):
+    def forward(self, Q, K, V, mask=None, is_causal=False):
         batch_size = Q.size(0)
-        
-        Q = self.W_q(Q).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        K = self.W_k(K).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        V = self.W_v(V).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        
-        output = self.scaled_dot_product_attention(Q, K, V, mask)
+
+        q_proj, k_proj, v_proj = _model_stack.runtime_qkv(self.W_q, self.W_k, self.W_v, Q, K, V)
+        Q = q_proj.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        K = k_proj.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        V = v_proj.view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+
+        output = _model_stack.runtime_attention(Q, K, V, mask=mask, is_causal=is_causal)
         output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
-        return self.W_o(output)
+        return _model_stack.runtime_linear(self.W_o, output)
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_seq_length=5000):
@@ -62,18 +56,15 @@ class TransformerBlock(nn.Module):
         self.attention = MultiHeadAttention(d_model, num_heads)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.feed_forward = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.ReLU(),
-            nn.Linear(d_ff, d_model)
-        )
+        self.ff_in = nn.Linear(d_model, d_ff)
+        self.ff_out = nn.Linear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x, mask=None):
-        attention_output = self.attention(x, x, x, mask)
-        x = self.norm1(x + self.dropout(attention_output))
-        ff_output = self.feed_forward(x)
-        x = self.norm2(x + self.dropout(ff_output))
+    def forward(self, x, mask=None, is_causal=False):
+        attention_output = self.attention(x, x, x, mask=mask, is_causal=is_causal)
+        x = _model_stack.runtime_add_layer_norm(x, self.dropout(attention_output), self.norm1)
+        ff_output = _model_stack.runtime_mlp(self.ff_in, self.ff_out, x, activation="relu")
+        x = _model_stack.runtime_add_layer_norm(x, self.dropout(ff_output), self.norm2)
         return x
 
 class SimpleTransformer(nn.Module):
@@ -89,15 +80,13 @@ class SimpleTransformer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x, mask=None):
-        x = self.embedding(x)
+        use_causal = mask is None
+
+        x = _model_stack.runtime_embedding(self.embedding, x)
         x = self.positional_encoding(x)
         x = self.dropout(x)
-        
-        # Create causal mask for autoregressive generation if no mask provided
-        if mask is None:
-            mask = create_causal_mask(x.size(1)).to(x.device)
-        
+
         for transformer_block in self.transformer_blocks:
-            x = transformer_block(x, mask)
-            
-        return self.fc(x) 
+            x = transformer_block(x, mask, is_causal=use_causal)
+
+        return _model_stack.runtime_linear(self.fc, x)
